@@ -54,9 +54,9 @@ impl CommandsTest {
     }
 }
 
-fn default_jinja_context(output: &Output) -> Jinja {
+fn default_jinja_context(output: &Output, recipe_path: PathBuf) -> Jinja {
     let selector_config = output.build_configuration.selector_config();
-    Jinja::new(selector_config).with_context(&output.recipe.context)
+    Jinja::new(selector_config, recipe_path).with_context(&output.recipe.context)
 }
 
 /// Write out the test files for the final package
@@ -90,7 +90,7 @@ pub(crate) fn write_test_files(
             // Note: we want to improve this with better rendering in the future
             let contents = command_test.script.resolve_content(
                 &output.build_configuration.directories.recipe_dir,
-                Some(default_jinja_context(output)),
+                Some(default_jinja_context(output, PathBuf::default())),
                 &["sh", "bat"],
             )?;
 

@@ -3,6 +3,7 @@
 use fs_err as fs;
 use indexmap::IndexMap;
 use minijinja::syntax::SyntaxConfig;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::{collections::BTreeMap, str::FromStr};
@@ -55,8 +56,8 @@ pub struct Jinja {
 
 impl Jinja {
     /// Create a new Jinja instance with the given selector configuration.
-    pub fn new(config: SelectorConfig) -> Self {
-        let env = set_jinja(&config);
+    pub fn new(config: SelectorConfig, recipe_filepath: PathBuf) -> Self {
+        let env = set_jinja(&config, recipe_filepath);
         let context = config.into_context();
         Self { env, context }
     }
@@ -108,7 +109,7 @@ impl Jinja {
 impl Default for Jinja {
     fn default() -> Self {
         Self {
-            env: set_jinja(&SelectorConfig::default()),
+            env: set_jinja(&SelectorConfig::default(), PathBuf::default()),
             context: BTreeMap::new(),
         }
     }
@@ -384,7 +385,7 @@ lazy_static::lazy_static! {
         .unwrap();
 }
 
-fn set_jinja(config: &SelectorConfig) -> minijinja::Environment<'static> {
+fn set_jinja(config: &SelectorConfig, recipe_filepath: PathBuf) -> minijinja::Environment<'static> {
     let SelectorConfig {
         target_platform,
         host_platform,
@@ -392,7 +393,6 @@ fn set_jinja(config: &SelectorConfig) -> minijinja::Environment<'static> {
         variant,
         experimental,
         allow_undefined,
-        recipe_filepath,
         ..
     } = config.clone();
 
