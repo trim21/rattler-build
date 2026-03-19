@@ -43,6 +43,13 @@ tests:
       recipe:
         - tests/
 
+  # run test scripts with environment variables. Note that the interpreter is
+  # inferred automatically and the test file is copied from recipe or source directory
+  - script:
+      env:
+        HELLO: "Hello World!"
+      file: run_my_test_script.py
+
   # python specific tests
   - python:
       # this test section tries to import the python modules and errors if it can't
@@ -59,10 +66,20 @@ tests:
       modules:
         - JSON
 
-  # test the contents of the package. If any of the globs does not match _any_ file, the test fails.
+  # test the contents of the package.
   - package_contents:
       files:
         - share/package/*.txt
+        - lib/python*/site-packages/mypackage/*.py
+
+  # test with strict mode: fails if there are any files not matched by the globs
+  - package_contents:
+      strict: true
+      files:
+        - share/package/*.txt
+        - bin/myapp
+      lib:
+        - mylib
 ```
 
 ### Testing package contents
@@ -73,11 +90,23 @@ It can be very useful as a "sanity check" to ensure that the package contains th
 
 It has multiple sub-keys that help when building cross-platform packages:
 
-- **`files`**: a list of globs that should match at least one file in the package. If any of the globs do not match, the test fails.
+- **`files`**: Specifies glob patterns for files that should exist in the package. You can provide a simple list of globs that should match at least one file in the package. If any pattern doesn't match at least one file, the test fails.
+
+  > **Note**: For more advanced use cases, you can also use the expanded form with `exists` and `not_exists` fields:
+  > ```yaml
+  > files:
+  >   exists:
+  >     - share/package/*.txt
+  >     - lib/python*/site-packages/mypackage/*.py
+  >   not_exists:
+  >     - lib/python*/site-packages/mypackage/deprecated_module.py
+  > ```
+
 - **`lib`**: matches libraries in the package (`.so`, `.dll`, `.dylib` files). The test fails if any of the libraries are not found. It's enough to specify the library name without any extension (e.g. `foo` will match `libfoo.so`, `libfoo.dylib`, and `foo.dll`).
 - **`include`**: matches files under the `include` directory in the package. You can specify the file name like `foo.h`.
 - **`bin`**: matches files under the `bin` directory in the package. You can specify executable names like `foo` which will match `foo.exe` on Windows and `foo` on Linux and macOS.
 - **`site_packages`**: matches files under the `site-packages` directory in the package. You can specify the import path like `foobar.api` which will match `foobar/api.py` and `foobar/api/__init__.py`.
+- **`strict`**: when set to `true`, enables strict mode. In strict mode, the test will fail if there are any files in the package that don't match any of the specified globs. (default: `false`).
 
 ## Testing existing packages
 

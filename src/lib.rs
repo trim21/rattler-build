@@ -1,86 +1,180 @@
 #![deny(missing_docs)]
 
-//! rattler-build library.
+//! Rattler-Build library.
 
-pub mod build;
-pub mod cache;
-pub mod conda_build_config;
-pub mod console_utils;
-pub mod metadata;
-mod normalized_key;
+// Re-export all core modules from rattler_build_core
+pub use rattler_build_core::build;
+pub use rattler_build_core::bump_recipe;
+pub use rattler_build_core::console_utils;
+pub use rattler_build_core::debug;
+pub use rattler_build_core::env_vars;
+pub use rattler_build_core::metadata;
+pub use rattler_build_core::migrate_recipe;
+pub use rattler_build_core::package_test;
+pub use rattler_build_core::packaging;
+pub use rattler_build_core::publish;
+pub use rattler_build_core::rebuild;
+pub use rattler_build_core::render;
+pub use rattler_build_core::script;
+pub use rattler_build_core::source;
+pub use rattler_build_core::staging;
+pub use rattler_build_core::system_tools;
+pub use rattler_build_core::tool_configuration;
+pub use rattler_build_core::types;
+pub use rattler_build_core::utils;
+
 pub mod opt;
-pub mod package_test;
-pub mod packaging;
-pub mod recipe;
-pub mod render;
-pub mod script;
-pub mod selectors;
-pub mod source;
-pub mod system_tools;
-pub mod tool_configuration;
-#[cfg(feature = "tui")]
-pub mod tui;
-mod url_with_trailing_slash;
-pub mod used_variables;
-pub mod utils;
-pub mod variant_config;
-mod variant_render;
 
-mod consts;
-mod env_vars;
-pub mod hash;
-mod linux;
-mod macos;
-mod post_process;
-pub mod rebuild;
+// Re-export recipe generator
 #[cfg(feature = "recipe-generation")]
-pub mod recipe_generator;
-mod run_exports;
-mod unix;
-pub mod upload;
-mod windows;
+pub use rattler_build_recipe_generator as recipe_generator;
 
-mod package_cache_reporter;
-pub mod source_code;
+// Re-export types needed by Python bindings and external consumers
+pub use rattler_build_core::{BuildString, DiscoveredOutput, Recipe, RenderConfig, Variable};
+pub use rattler_build_recipe::stage1::{HashInfo, HashInput};
+pub use rattler_build_types::NormalizedKey;
 
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
     sync::{Arc, Mutex},
 };
 
-use build::{run_build, skip_existing};
+use build::{WorkingDirectoryBehavior, run_build, skip_existing};
 use console_utils::LoggingOutputHandler;
 use dunce::canonicalize;
 use fs_err as fs;
 use futures::FutureExt;
-use metadata::{
-    BuildConfiguration, BuildSummary, Directories, Output, PackageIdentifier, PackagingSettings,
-    build_reindexed_channels,
-};
 use miette::{Context, IntoDiagnostic};
-pub use normalized_key::NormalizedKey;
 use opt::*;
 use package_test::TestConfiguration;
-use petgraph::{algo::toposort, graph::DiGraph, visit::DfsPostOrder};
-use pixi_config::PackageFormatAndCompression;
+use rattler_build_core::consts;
+use rattler_build_recipe::{stage0, stage1::TestType};
+use rattler_build_variant_config::VariantConfig;
 use rattler_conda_types::{
-    GenericVirtualPackage, MatchSpec, NamedChannelOrUrl, PackageName, Platform,
-    package::ArchiveType,
+    MatchSpec, NamedChannelOrUrl, NoArchType, PackageName, Platform,
+    compression_level::CompressionLevel, package::CondaArchiveType,
 };
-use rattler_package_streaming::write::CompressionLevel;
+use rattler_config::config::build::PackageFormatAndCompression;
+use rattler_index::ensure_channel_initialized_fs;
+#[cfg(feature = "s3")]
+use rattler_index::ensure_channel_initialized_s3;
 use rattler_solve::SolveStrategy;
-use rattler_virtual_packages::{VirtualPackage, VirtualPackageOverrides};
-use recipe::parser::{Dependency, TestType, find_outputs_from_src};
-use selectors::SelectorConfig;
-use source_code::Source;
+use rattler_virtual_packages::VirtualPackageOverrides;
+use render::resolved_dependencies::RunExportsDownload;
 use system_tools::SystemTools;
 use tool_configuration::{Configuration, ContinueOnFailure, SkipExisting, TestStrategy};
-use variant_config::VariantConfig;
+use types::Directories;
+use types::{
+    BuildConfiguration, BuildSummary, PackageIdentifier, PackagingSettings,
+    build_reindexed_channels,
+};
 
-use crate::metadata::Debug;
-use crate::metadata::PlatformWithVirtualPackages;
+use crate::metadata::{Output, PlatformWithVirtualPackages};
+use crate::publish::{
+    BuildNumberOverride, PublishConfig, apply_build_number_override, fetch_highest_build_numbers,
+    upload_and_index_channel,
+};
+use indexmap::IndexSet;
+use rattler_build_recipe::topological_sort_by_dependencies;
+
+/// Result of finding variants, including the top-level recipe name if available
+struct FoundVariants {
+    outputs: IndexSet<DiscoveredOutput>,
+    /// Top-level recipe name from multi-output recipes (if set and concrete)
+    recipe_name: Option<String>,
+}
+
+/// Find all variants from the recipe and variant config
+fn find_variants(
+    variant_config: &VariantConfig,
+    recipe_path: &std::path::Path,
+    recipe_content: &str,
+    target_platform: Platform,
+    build_platform: Platform,
+    host_platform: Platform,
+    experimental: bool,
+) -> Result<FoundVariants, miette::Error> {
+    // Parse the recipe
+    let source = rattler_build_recipe::source_code::Source::from_string(
+        recipe_path.display().to_string(),
+        recipe_content.to_string(),
+    );
+    let stage0_recipe =
+        rattler_build_recipe::parse_recipe(&source).wrap_err("Failed to parse recipe")?;
+
+    // Extract the top-level recipe name from multi-output recipes (if concrete)
+    let recipe_name = match &stage0_recipe {
+        stage0::Recipe::MultiOutput(multi) => multi
+            .recipe
+            .name
+            .as_ref()
+            .and_then(|v| v.as_concrete())
+            .map(|name| name.0.as_normalized().to_string()),
+        stage0::Recipe::SingleOutput(_) => None,
+    };
+
+    // Get OS environment variable keys that can be overridden by variant config
+    // We use an empty prefix path since we just need the keys, not the values
+    let os_env_var_keys = env_vars::os_vars(&std::path::PathBuf::new(), &host_platform)
+        .keys()
+        .cloned()
+        .collect();
+
+    // Build render config with platform information, experimental flag, and recipe path
+    let render_config = RenderConfig::new()
+        .with_target_platform(target_platform)
+        .with_build_platform(build_platform)
+        .with_host_platform(host_platform)
+        .with_experimental(experimental)
+        .with_recipe_path(recipe_path)
+        .with_os_env_var_keys(os_env_var_keys);
+
+    // Render with variant config (handles both single and multi-output recipes)
+    let rendered_variants =
+        rattler_build_recipe::render_recipe(&source, &stage0_recipe, variant_config, render_config)
+            .wrap_err("Failed to render recipe with variants")?;
+
+    // Convert to DiscoveredOutputs
+    let mut recipes = IndexSet::new();
+    for rendered in rendered_variants {
+        let recipe = rendered.recipe;
+        let variant = rendered.variant;
+
+        let effective_target_platform = if recipe.build().noarch.is_none() {
+            target_platform
+        } else {
+            Platform::NoArch
+        };
+
+        // The recipe has already been evaluated and has its build string resolved
+        // (including proper variant filtering for noarch python)
+        // Extract the build string and hash from the already-evaluated recipe
+        let build_string = recipe
+            .build()
+            .string
+            .as_resolved()
+            .expect("Recipe build string should be resolved after evaluation");
+
+        recipes.insert(DiscoveredOutput {
+            name: recipe.package().name().as_source().to_string(),
+            version: recipe.package().version().to_string(),
+            build_string: build_string.to_string(),
+            noarch_type: recipe.build().noarch.unwrap_or(NoArchType::none()),
+            target_platform: effective_target_platform,
+            used_vars: variant,
+            recipe,
+            hash: rendered.hash_info.expect("Should be set after evaluation"),
+        });
+    }
+
+    Ok(FoundVariants {
+        outputs: recipes,
+        recipe_name,
+    })
+}
 
 /// Returns the recipe path.
 pub fn get_recipe_path(path: &Path) -> miette::Result<PathBuf> {
@@ -133,6 +227,7 @@ pub fn get_tool_config(
 ) -> miette::Result<Configuration> {
     let client = tool_configuration::reqwest_client_from_auth_storage(
         build_data.common.auth_file.clone(),
+        #[cfg(feature = "s3")]
         build_data.common.s3_config.clone(),
         build_data.common.mirror_config.clone(),
         build_data.common.allow_insecure_host.clone(),
@@ -148,7 +243,14 @@ pub fn get_tool_config(
         .with_continue_on_failure(build_data.continue_on_failure)
         .with_noarch_build_platform(build_data.noarch_build_platform)
         .with_channel_priority(build_data.common.channel_priority)
-        .with_allow_insecure_host(build_data.common.allow_insecure_host.clone());
+        .with_allow_insecure_host(build_data.common.allow_insecure_host.clone())
+        .with_error_prefix_in_binary(build_data.error_prefix_in_binary)
+        .with_allow_symlinks_on_windows(build_data.allow_symlinks_on_windows)
+        .with_allow_absolute_license_paths(build_data.allow_absolute_license_paths)
+        .with_io_concurrency_limit(Some(build_data.io_concurrency_limit))
+        .with_zstd_repodata_enabled(build_data.common.use_zstd)
+        .with_bz2_repodata_enabled(build_data.common.use_bz2)
+        .with_sharded_repodata_enabled(build_data.common.use_sharded);
 
     let configuration_builder = if let Some(fancy_log_handler) = fancy_log_handler {
         configuration_builder.with_logging_output_handler(fancy_log_handler.clone())
@@ -178,21 +280,6 @@ pub async fn get_build_output(
         ));
     }
 
-    // Determine virtual packages of the system. These packages define the
-    // capabilities of the system. Some packages depend on these virtual
-    // packages to indicate compatibility with the hardware of the system.
-    let virtual_packages = tool_config
-        .fancy_log_handler
-        .wrap_in_progress("determining virtual packages", move || {
-            VirtualPackage::detect(&VirtualPackageOverrides::from_env()).map(|vpkgs| {
-                vpkgs
-                    .iter()
-                    .map(|vpkg| GenericVirtualPackage::from(vpkg.clone()))
-                    .collect::<Vec<_>>()
-            })
-        })
-        .into_diagnostic()?;
-
     tracing::debug!(
         "Platforms: build: {}, host: {}, target: {}",
         build_data.build_platform,
@@ -200,25 +287,23 @@ pub async fn get_build_output(
         build_data.target_platform
     );
 
-    let selector_config = SelectorConfig {
-        // We ignore noarch here
-        target_platform: build_data.target_platform,
-        host_platform: build_data.host_platform,
-        hash: None,
-        build_platform: build_data.build_platform,
-        variant: BTreeMap::new(),
-        experimental: build_data.common.experimental,
-        // allow undefined while finding the variants
-        allow_undefined: true,
-        recipe_path: Some(recipe_path.to_path_buf()),
-    };
-
     let span = tracing::info_span!("Finding outputs from recipe");
     let enter = span.enter();
 
-    // First find all outputs from the recipe
-    let named_source = Source::from_path(recipe_path).into_diagnostic()?;
-    let outputs = find_outputs_from_src(named_source.clone())?;
+    // Read the recipe content
+    let recipe_content = fs::read_to_string(recipe_path).into_diagnostic()?;
+
+    // Detect deprecated `cache:` key and give a helpful error
+    if migrate_recipe::has_cache_key(&recipe_content) {
+        return Err(miette::miette!(
+            "this recipe uses the deprecated top-level 'cache:' key. \
+             The 'cache' format has been replaced by 'staging' outputs. \
+             To automatically migrate your recipe, run:\n\n\
+             rattler-build migrate-recipe --recipe {}\n\n\
+             For more information, see: https://rattler-build.prefix.dev/latest/multiple_output_cache/",
+            recipe_path.display()
+        ));
+    }
 
     // Check if there is a `variants.yaml` or `conda_build_config.yaml` file next to
     // the recipe that we should potentially use.
@@ -229,20 +314,20 @@ pub async fn get_build_output(
         consts::VARIANTS_CONFIG_FILE,
         consts::CONDA_BUILD_CONFIG_FILE,
     ] {
-        if let Some(variant_path) = recipe_path.parent().map(|parent| parent.join(file)) {
-            if variant_path.is_file() {
-                if !build_data.ignore_recipe_variants {
-                    let mut configs = build_data.variant_config.clone();
-                    configs.push(variant_path);
-                    detected_variant_config = Some(configs);
-                } else {
-                    tracing::debug!(
-                        "Ignoring variants from {} because \"--ignore-recipe-variants\" was specified",
-                        variant_path.display()
-                    );
-                }
-                break;
+        if let Some(variant_path) = recipe_path.parent().map(|parent| parent.join(file))
+            && variant_path.is_file()
+        {
+            if !build_data.ignore_recipe_variants {
+                let mut configs = build_data.variant_config.clone();
+                configs.push(variant_path);
+                detected_variant_config = Some(configs);
+            } else {
+                tracing::debug!(
+                    "Ignoring variants from {} because \"--ignore-recipe-variants\" was specified",
+                    variant_path.display()
+                );
             }
+            break;
         };
     }
 
@@ -251,17 +336,80 @@ pub async fn get_build_output(
     let mut variant_configs = detected_variant_config.unwrap_or_default();
     variant_configs.extend(build_data.variant_config.clone());
 
-    let variant_config = VariantConfig::from_files(&variant_configs, &selector_config)?;
+    let mut variant_config =
+        VariantConfig::from_files(&variant_configs, build_data.target_platform).map_err(|e| {
+            // Check if this is a ParseError with a file path
+            if let rattler_build_variant_config::VariantConfigError::ParseError { path, source } =
+                &e
+            {
+                // Read the file to provide source code context
+                if let Ok(content) = fs_err::read_to_string(path) {
+                    let source_code = rattler_build_recipe::source_code::Source::from_string(
+                        path.display().to_string(),
+                        content,
+                    );
+                    let error_with_source = rattler_build_recipe::ParseErrorWithSource::new(
+                        source_code,
+                        source.clone(),
+                    );
+                    return miette::Report::new(error_with_source);
+                }
+            }
+            // Fallback to original error if we can't provide source context
+            miette::Report::new(e)
+        })?;
 
-    let outputs_and_variants =
-        variant_config.find_variants(&outputs, named_source, &selector_config)?;
+    // Warn if target_platform is set in variant config - it's not supported and will be ignored
+    let target_platform_variants = variant_config
+        .variants
+        .get(&NormalizedKey("target_platform".into()));
+    if target_platform_variants.is_some()
+        && target_platform_variants
+            .map(|v| v != &vec![Variable::from(build_data.target_platform.to_string())])
+            .unwrap_or(false)
+    {
+        tracing::warn!(
+            "Setting 'target_platform' in a variant config file is not supported and will be ignored. \
+            Please use the '--target-platform' command-line flag to specify the target platform."
+        );
+    }
+
+    // Always insert target_platform and build_platform
+    variant_config.variants.insert(
+        "target_platform".into(),
+        vec![Variable::from(build_data.target_platform.to_string())],
+    );
+    variant_config.variants.insert(
+        "build_platform".into(),
+        vec![Variable::from(build_data.build_platform.to_string())],
+    );
+
+    // Apply variant overrides from command line
+    for (key, values) in &build_data.variant_overrides {
+        let normalized_key = NormalizedKey::from(key.as_str());
+        let variables: Vec<Variable> = values.iter().map(|v| Variable::from_string(v)).collect();
+        variant_config.variants.insert(normalized_key, variables);
+    }
+
+    let FoundVariants {
+        outputs: outputs_and_variants,
+        recipe_name,
+    } = find_variants(
+        &variant_config,
+        recipe_path,
+        &recipe_content,
+        build_data.target_platform,
+        build_data.build_platform,
+        build_data.host_platform,
+        build_data.common.experimental,
+    )?;
 
     tracing::info!("Found {} variants\n", outputs_and_variants.len());
     for discovered_output in &outputs_and_variants {
-        let skipped = if discovered_output.recipe.build().skip() {
+        let skipped = if discovered_output.recipe.build().skip {
             console::style(" (skipped)").red().to_string()
         } else {
-            "".to_string()
+            String::new()
         };
 
         tracing::info!(
@@ -287,15 +435,25 @@ pub async fn get_build_output(
     let mut subpackages = BTreeMap::new();
     let mut outputs = Vec::new();
 
-    let global_build_name = outputs_and_variants
-        .first()
-        .map(|o| o.name.clone())
-        .unwrap_or_default();
+    // For multi-output recipes, all outputs (including staging caches) need to use the same
+    // build directory so that paths are consistent across outputs.
+    // Use the top-level recipe name if available, otherwise fall back to the first output name.
+    let global_build_name = recipe_name
+        .or_else(|| outputs_and_variants.first().map(|o| o.name.clone()))
+        .unwrap_or_else(|| "build".to_string());
+
+    let timestamp = chrono::Utc::now();
 
     for discovered_output in outputs_and_variants {
         let recipe = &discovered_output.recipe;
 
-        if recipe.build().skip() {
+        // Check if this build should be skipped based on skip conditions
+        if recipe.build().skip {
+            tracing::info!(
+                "Skipping {} {} - skip conditions evaluated to true",
+                recipe.package().name().as_normalized(),
+                recipe.package().version()
+            );
             continue;
         }
 
@@ -308,7 +466,10 @@ pub async fn get_build_output(
             },
         );
 
-        let build_name = if recipe.cache.is_some() {
+        // Use the global build name for outputs that inherit from staging caches
+        // This ensures staging caches and their dependent packages share the same build directory
+        // Otherwise, use the output's own name for the build directory
+        let build_name = if recipe.inherits_from.is_some() {
             global_build_name.clone()
         } else {
             recipe.package().name().as_normalized().to_string()
@@ -353,30 +514,33 @@ pub async fn get_build_output(
             .collect::<Result<Vec<_>, _>>()
             .into_diagnostic()?;
 
-        let timestamp = chrono::Utc::now();
-
-        let output = metadata::Output {
-            recipe: recipe.clone(),
+        let virtual_package_override = VirtualPackageOverrides::from_env();
+        let output = Output {
+            recipe: discovered_output.recipe.clone(),
             build_configuration: BuildConfiguration {
                 target_platform: discovered_output.target_platform,
-                host_platform: PlatformWithVirtualPackages {
-                    platform: build_data.host_platform,
-                    virtual_packages: virtual_packages.clone(),
-                },
-                build_platform: PlatformWithVirtualPackages {
-                    platform: build_data.build_platform,
-                    virtual_packages: virtual_packages.clone(),
-                },
+                host_platform: PlatformWithVirtualPackages::detect_for_platform(
+                    build_data.host_platform,
+                    &virtual_package_override,
+                )
+                .into_diagnostic()?,
+                build_platform: PlatformWithVirtualPackages::detect_for_platform(
+                    build_data.build_platform,
+                    &virtual_package_override,
+                )
+                .into_diagnostic()?,
                 hash: discovered_output.hash.clone(),
                 variant: discovered_output.used_vars.clone(),
-                directories: Directories::setup(
+                directories: Directories::builder(
                     &build_name,
                     recipe_path,
                     &output_dir,
-                    build_data.no_build_id,
                     &timestamp,
-                    recipe.build().merge_build_and_host_envs(),
                 )
+                .no_build_id(build_data.no_build_id)
+                .merge_build_and_host(recipe.build().merge_build_and_host_envs)
+                .skip_directory_creation(build_data.render_only)
+                .build()
                 .into_diagnostic()?,
                 channels,
                 channel_priority: tool_config.channel_priority,
@@ -390,7 +554,7 @@ pub async fn get_build_output(
                 store_recipe: !build_data.no_include_recipe,
                 force_colors: build_data.color_build_log && console::colors_enabled(),
                 sandbox_config: build_data.sandbox_configuration.clone(),
-                debug: build_data.debug,
+                exclude_newer: build_data.exclude_newer,
             },
             finalized_dependencies: None,
             finalized_sources: None,
@@ -411,23 +575,52 @@ pub async fn get_build_output(
         outputs.push(output);
     }
 
+    // Override build numbers if --build-num was specified
+    if let Some(build_num_override) = build_data.build_num_override {
+        tracing::info!(
+            "Overriding build number to {} for all outputs",
+            build_num_override
+        );
+        for output in &mut outputs {
+            // Update the build number
+            output.recipe.build.number = Some(build_num_override);
+
+            // Extract the hash from the current build string and recompute with new build number
+            // Build string format is: {hash}_{build_number}
+            let current_build_string = output
+                .recipe
+                .build
+                .string
+                .as_resolved()
+                .expect("Build string should be resolved at this point");
+
+            // Split on last '_' to separate hash from build number
+            // TODO should we fail if we do not have a "standard" build string with build number at the end?
+            if let Some(last_underscore) = current_build_string.rfind('_') {
+                let hash_part = &current_build_string[..last_underscore];
+                let new_build_string = format!("{}_{}", hash_part, build_num_override);
+                output.recipe.build.string = BuildString::Resolved(new_build_string);
+            }
+        }
+    }
+
     Ok(outputs)
 }
 
 fn can_test(output: &Output, all_output_names: &[&PackageName], done_outputs: &[Output]) -> bool {
     let check_if_matches = |spec: &MatchSpec, output: &Output| -> bool {
-        if spec.name.as_ref() != Some(output.name()) {
+        if spec.name.as_exact() != Some(&output.name().clone()) {
             return false;
         }
-        if let Some(version_spec) = &spec.version {
-            if !version_spec.matches(output.recipe.package().version()) {
-                return false;
-            }
+        if let Some(version_spec) = &spec.version
+            && !version_spec.matches(output.recipe.package().version())
+        {
+            return false;
         }
-        if let Some(build_string_spec) = &spec.build {
-            if !build_string_spec.matches(&output.build_string()) {
-                return false;
-            }
+        if let Some(build_string_spec) = &spec.build
+            && !build_string_spec.matches(&output.build_string())
+        {
+            return false;
         }
         true
     };
@@ -437,7 +630,7 @@ fn can_test(output: &Output, all_output_names: &[&PackageName], done_outputs: &[
         for dep in &deps.run.depends {
             if all_output_names
                 .iter()
-                .any(|o| Some(*o) == dep.spec().name.as_ref())
+                .any(|o| dep.spec().name.as_exact() == Some(*o))
             {
                 // this dependency might not be built yet
                 if !done_outputs.iter().any(|o| check_if_matches(dep.spec(), o)) {
@@ -449,20 +642,28 @@ fn can_test(output: &Output, all_output_names: &[&PackageName], done_outputs: &[
 
     // Also check that for all script tests
     for test in output.recipe.tests() {
-        if let TestType::Command(command) = test {
+        if let TestType::Commands(command) = test {
             for dep in command
                 .requirements
                 .build
                 .iter()
                 .chain(command.requirements.run.iter())
             {
-                let dep_spec: MatchSpec = dep.parse().expect("Could not parse MatchSpec");
-                if all_output_names
-                    .iter()
-                    .any(|o| Some(*o) == dep_spec.name.as_ref())
-                {
+                let dep_name = dep.name();
+                if all_output_names.iter().any(|o| Some(*o) == dep_name) {
                     // this dependency might not be built yet
-                    if !done_outputs.iter().any(|o| check_if_matches(&dep_spec, o)) {
+                    // For pin_subpackage/pin_compatible, we only check name match
+                    // For regular specs, we also check version/build if specified
+                    let is_built = match dep {
+                        rattler_build_recipe::stage1::Dependency::Spec(spec) => {
+                            done_outputs.iter().any(|o| check_if_matches(spec, o))
+                        }
+                        _ => {
+                            // For pins, just check if any output with that name is built
+                            done_outputs.iter().any(|o| Some(o.name()) == dep_name)
+                        }
+                    };
+                    if !is_built {
                         return false;
                     }
                 }
@@ -477,21 +678,25 @@ fn can_test(output: &Output, all_output_names: &[&PackageName], done_outputs: &[
 pub async fn run_build_from_args(
     build_output: Vec<Output>,
     tool_configuration: Configuration,
+    markdown_summary: Option<&Path>,
 ) -> miette::Result<()> {
     let mut outputs = Vec::new();
     let mut test_queue = Vec::new();
-
     let outputs_to_build = skip_existing(build_output, &tool_configuration).await?;
 
     let all_output_names = outputs_to_build
         .iter()
         .map(|o| o.name())
         .collect::<Vec<_>>();
-
+    tracing::info!("Starting build of {} outputs", outputs_to_build.len());
     for (index, output) in outputs_to_build.iter().enumerate() {
-        let (output, archive) = match run_build(output.clone(), &tool_configuration)
-            .boxed_local()
-            .await
+        let (output, archive) = match run_build(
+            output.clone(),
+            &tool_configuration,
+            WorkingDirectoryBehavior::Cleanup,
+        )
+        .boxed_local()
+        .await
         {
             Ok((output, archive)) => {
                 output.record_build_end();
@@ -557,12 +762,15 @@ pub async fn run_build_from_args(
                 to_test
             };
 
-            // let testable = can_test(&test_queue, &all_output_names, &outputs_to_build);
             for (output, archive) in &to_test {
-                package_test::run_test(
+                match package_test::run_test(
                     archive,
                     &TestConfiguration {
-                        test_prefix: output.build_configuration.directories.work_dir.join("test"),
+                        test_prefix: output
+                            .build_configuration
+                            .directories
+                            .output_dir
+                            .join("test"),
                         target_platform: Some(output.build_configuration.target_platform),
                         host_platform: Some(output.build_configuration.host_platform.clone()),
                         current_platform: output.build_configuration.build_platform.clone(),
@@ -577,11 +785,49 @@ pub async fn run_build_from_args(
                         channel_priority: tool_configuration.channel_priority,
                         solve_strategy: SolveStrategy::Highest,
                         tool_configuration: tool_configuration.clone(),
+                        test_index: None,
+                        output_dir: output.build_configuration.directories.output_dir.clone(),
+                        exclude_newer: output.build_configuration.exclude_newer,
                     },
                     None,
                 )
                 .await
-                .into_diagnostic()?;
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // move the package file to the failed directory
+                        let failed_dir = output
+                            .build_configuration
+                            .directories
+                            .output_dir
+                            .join("broken");
+                        fs::create_dir_all(&failed_dir).into_diagnostic()?;
+                        fs::rename(archive, failed_dir.join(archive.file_name().unwrap()))
+                            .into_diagnostic()?;
+
+                        // Reindex the output directory so that the broken package is no longer
+                        // listed in the repodata. This is important for --skip-existing to work
+                        // correctly on subsequent builds.
+                        if let Err(e) = build_reindexed_channels(
+                            &output.build_configuration,
+                            &tool_configuration,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Failed to reindex output directory after moving package to broken folder: {}",
+                                e
+                            );
+                        }
+
+                        if tool_configuration.continue_on_failure == ContinueOnFailure::Yes {
+                            tracing::error!("Test failed for {}: {}", output.identifier(), e);
+                            output.record_warning(&format!("Test failed: {}", e));
+                        } else {
+                            return Err(miette::miette!("Test failed: {}", e));
+                        }
+                    }
+                }
             }
         }
     }
@@ -594,6 +840,14 @@ pub async fn run_build_from_args(
             tracing::error!("Error writing build summary: {}", e);
             e
         });
+
+        // Write to markdown summary file if requested
+        if let Some(md_path) = markdown_summary {
+            let _ = output.write_markdown_summary(md_path).map_err(|e| {
+                tracing::error!("Error writing markdown summary: {}", e);
+                e
+            });
+        }
     }
 
     Ok(())
@@ -661,6 +915,7 @@ pub async fn run_test(
         .with_reqwest_client(
             tool_configuration::reqwest_client_from_auth_storage(
                 test_data.common.auth_file,
+                #[cfg(feature = "s3")]
                 test_data.common.s3_config,
                 test_data.common.mirror_config,
                 test_data.common.allow_insecure_host.clone(),
@@ -687,10 +942,13 @@ pub async fn run_test(
         host_platform: None,
         current_platform,
         keep_test_prefix: false,
+        test_index: test_data.test_index,
         channels,
         channel_priority: tool_config.channel_priority,
         solve_strategy: SolveStrategy::Highest,
         tool_configuration: tool_config,
+        output_dir: test_data.common.output_dir,
+        exclude_newer: None,
     };
 
     let package_name = package_file
@@ -699,7 +957,7 @@ pub async fn run_test(
         .to_string_lossy()
         .to_string();
 
-    let span = tracing::info_span!("Running tests for", package = %package_name);
+    let span = tracing::info_span!("Running tests for", package = %package_name, span_color = package_name);
     let _enter = span.enter();
     package_test::run_test(&package_file, &test_options, None)
         .await
@@ -708,51 +966,124 @@ pub async fn run_test(
     Ok(())
 }
 
-/// Rebuild.
-pub async fn rebuild(
+/// Result of rebuilding a package.
+#[derive(Debug, Clone)]
+pub struct RebuildOutput {
+    /// Path to the original package
+    pub original_path: PathBuf,
+    /// Path to the rebuilt package
+    pub rebuilt_path: PathBuf,
+    /// SHA256 hash of the original package (hex-encoded)
+    pub original_sha256: String,
+    /// SHA256 hash of the rebuilt package (hex-encoded)
+    pub rebuilt_sha256: String,
+}
+
+impl RebuildOutput {
+    /// Returns true if the original and rebuilt packages are bit-for-bit identical.
+    pub fn is_identical(&self) -> bool {
+        self.original_sha256 == self.rebuilt_sha256
+    }
+}
+
+/// Core rebuild logic that extracts the recipe from a package and rebuilds it.
+///
+/// This function is the reusable core of the rebuild functionality, returning
+/// the result data for programmatic use (e.g., Python bindings).
+pub async fn rebuild_package_core(
     rebuild_data: RebuildData,
     fancy_log_handler: LoggingOutputHandler,
-) -> miette::Result<()> {
-    tracing::info!("Rebuilding {}", rebuild_data.package_file.to_string_lossy());
+) -> miette::Result<RebuildOutput> {
+    let reqwest_client = tool_configuration::reqwest_client_from_auth_storage(
+        rebuild_data.common.auth_file,
+        #[cfg(feature = "s3")]
+        rebuild_data.common.s3_config.clone(),
+        rebuild_data.common.mirror_config.clone(),
+        rebuild_data.common.allow_insecure_host.clone(),
+    )
+    .into_diagnostic()?;
+
+    // Check if the input is a URL or local path
+    let (_temp_dir_guard, package_path) = match rebuild_data.package_file {
+        PackageSource::Url(ref url) => {
+            // Download the package to a temporary location
+            tracing::info!("Downloading package from {}", url);
+
+            let response = reqwest_client
+                .get_client()
+                .get(url.as_str())
+                .send()
+                .await
+                .into_diagnostic()?;
+
+            if !response.status().is_success() {
+                miette::bail!("Failed to download package: HTTP {}", response.status());
+            }
+
+            // Extract filename from URL or use a default
+            let Some(filename) = url
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .map(|s| s.to_string())
+            else {
+                miette::bail!("Failed to extract filename from URL: {}", url);
+            };
+
+            let temp_dir = tempfile::tempdir().into_diagnostic()?;
+            let package_path = temp_dir.path().join(filename);
+
+            let bytes = response.bytes().await.into_diagnostic()?;
+            fs::write(&package_path, &bytes).into_diagnostic()?;
+
+            tracing::info!("Downloaded package to: {:?}", package_path);
+
+            // Keep the temp directory alive for the duration
+            (Some(temp_dir), package_path)
+        }
+        PackageSource::Path(ref path) => {
+            // Use the local path directly
+            (None, path.clone())
+        }
+    };
+
+    // Calculate SHA256 of the original package
+    let original_sha = rattler_digest::compute_file_digest::<rattler_digest::Sha256>(&package_path)
+        .into_diagnostic()?;
+
+    tracing::info!("Original package SHA256: {:x}", original_sha);
+    tracing::info!("Rebuilding \"{}\"", package_path.display());
+
     // we extract the recipe folder from the package file (info/recipe/*)
     // and then run the rendered recipe with the same arguments as the original
     // build
     let temp_folder = tempfile::tempdir().into_diagnostic()?;
 
-    rebuild::extract_recipe(&rebuild_data.package_file, temp_folder.path()).into_diagnostic()?;
+    rebuild::extract_recipe(&package_path, temp_folder.path()).into_diagnostic()?;
 
-    let temp_dir = temp_folder.into_path();
+    let temp_dir = temp_folder.keep();
 
     tracing::info!("Extracted recipe to: {:?}", temp_dir);
 
     let rendered_recipe =
         fs::read_to_string(temp_dir.join("rendered_recipe.yaml")).into_diagnostic()?;
 
-    let mut output: metadata::Output = serde_yaml::from_str(&rendered_recipe).into_diagnostic()?;
+    let mut output: Output = serde_yaml::from_str(&rendered_recipe).into_diagnostic()?;
 
     // set recipe dir to the temp folder
     output.build_configuration.directories.recipe_dir = temp_dir;
 
-    // create output dir and set it in the config
-    let output_dir = rebuild_data.common.output_dir;
+    // Use a temporary directory for the build output to avoid overwriting the original
+    let temp_output_dir = tempfile::tempdir().into_diagnostic()?;
+    let temp_output_path = temp_output_dir.path().to_path_buf();
 
-    fs::create_dir_all(&output_dir).into_diagnostic()?;
-    output.build_configuration.directories.output_dir =
-        canonicalize(output_dir).into_diagnostic()?;
+    fs::create_dir_all(&temp_output_path).into_diagnostic()?;
+    output.build_configuration.directories.output_dir = temp_output_path.clone();
 
     let tool_config = Configuration::builder()
         .with_logging_output_handler(fancy_log_handler)
         .with_keep_build(true)
         .with_compression_threads(rebuild_data.compression_threads)
-        .with_reqwest_client(
-            tool_configuration::reqwest_client_from_auth_storage(
-                rebuild_data.common.auth_file,
-                rebuild_data.common.s3_config.clone(),
-                rebuild_data.common.mirror_config.clone(),
-                rebuild_data.common.allow_insecure_host.clone(),
-            )
-            .into_diagnostic()?,
-        )
+        .with_reqwest_client(reqwest_client)
         .with_test_strategy(rebuild_data.test)
         .finish();
 
@@ -762,160 +1093,146 @@ pub async fn rebuild(
         .recreate_directories()
         .into_diagnostic()?;
 
-    run_build(output, &tool_config).await?;
+    let (rebuilt_output, temp_rebuilt_path) =
+        run_build(output, &tool_config, WorkingDirectoryBehavior::Cleanup).await?;
 
-    Ok(())
+    // Generate timestamp for the rebuilt package
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+
+    // Create final output directory
+    let final_output_dir = rebuild_data.common.output_dir.clone();
+    fs::create_dir_all(&final_output_dir).into_diagnostic()?;
+
+    // Insert timestamp before the extension
+    let new_filename = format!(
+        "{}-{}-{}-rebuilt-{timestamp}{}",
+        rebuilt_output.name().as_normalized(),
+        rebuilt_output.version(),
+        rebuilt_output.build_string(),
+        rebuilt_output
+            .build_configuration
+            .packaging_settings
+            .archive_type
+            .extension()
+    );
+
+    let rebuilt_path = final_output_dir.join(&new_filename);
+
+    // Move the rebuilt package to final location with new name
+    // Use copy+remove as fallback for cross-device moves
+    if let Err(e) = fs::rename(&temp_rebuilt_path, &rebuilt_path) {
+        if e.kind() == std::io::ErrorKind::CrossesDevices {
+            fs::copy(&temp_rebuilt_path, &rebuilt_path).into_diagnostic()?;
+            fs::remove_file(&temp_rebuilt_path).into_diagnostic()?;
+        } else {
+            return Err(e).into_diagnostic();
+        }
+    }
+
+    // Now we can drop the temp directory
+    drop(temp_output_dir);
+
+    // Calculate SHA256 of the rebuilt package
+    let rebuilt_sha = rattler_digest::compute_file_digest::<rattler_digest::Sha256>(&rebuilt_path)
+        .into_diagnostic()?;
+
+    tracing::info!("Rebuilt package SHA256: {:x}", rebuilt_sha);
+    tracing::info!("Rebuilt package saved to: \"{:?}\"", rebuilt_path);
+
+    Ok(RebuildOutput {
+        original_path: package_path,
+        rebuilt_path,
+        original_sha256: format!("{:x}", original_sha),
+        rebuilt_sha256: format!("{:x}", rebuilt_sha),
+    })
 }
 
-/// Upload.
-pub async fn upload_from_args(args: UploadOpts) -> miette::Result<()> {
-    if args.package_files.is_empty() {
-        return Err(miette::miette!("No package files were provided."));
+/// Rebuild a package from its embedded recipe (CLI entry point).
+///
+/// This function wraps [`rebuild_package_core`] and adds interactive features
+/// like diffoscope comparison prompts that are suitable for CLI use.
+pub async fn rebuild(
+    rebuild_data: RebuildData,
+    fancy_log_handler: LoggingOutputHandler,
+) -> miette::Result<()> {
+    let result = rebuild_package_core(rebuild_data, fancy_log_handler).await?;
+
+    // Compare the SHA hashes
+    if result.is_identical() {
+        tracing::info!(
+            "✅ Rebuild successful! SHA256 hashes match. Packages are bit-for-bit identical!"
+        );
+    } else {
+        tracing::warn!("❌ Rebuild produced different output! SHA256 hashes do not match.");
+        tracing::info!("❌ Rebuild produced different output!");
+        tracing::info!("  Original SHA256: {}", result.original_sha256);
+        tracing::info!("  Rebuilt SHA256:  {}", result.rebuilt_sha256);
+        tracing::info!("  Rebuilt package: {}", result.rebuilt_path.display());
+
+        // Check if diffoscope is available
+        let diffoscope_available = Command::new("diffoscope").arg("--version").output().is_ok();
+
+        if diffoscope_available {
+            // In interactive mode, ask the user; in CI/non-TTY, run automatically
+            let should_run = if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                dialoguer::Confirm::new()
+                    .with_prompt("Do you want to run diffoscope?")
+                    .interact()
+                    .unwrap_or(true)
+            } else {
+                true
+            };
+
+            if should_run {
+                let mut command = Command::new("diffoscope");
+                command
+                    .arg(&result.original_path)
+                    .arg(&result.rebuilt_path)
+                    .arg("--text-color")
+                    .arg("always");
+
+                tracing::info!("Running diffoscope: {:?}", command);
+
+                let output = command.output().into_diagnostic()?;
+
+                tracing::info!("{}", String::from_utf8_lossy(&output.stdout));
+                if !output.stderr.is_empty() {
+                    tracing::info!("{}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+        } else {
+            tracing::info!("\nHint: Install diffoscope to see detailed differences:");
+            tracing::info!("  pixi global install diffoscope");
+        }
     }
 
-    for package_file in &args.package_files {
-        if ArchiveType::try_from(package_file).is_none() {
-            return Err(miette::miette!(
-                "The file {} does not appear to be a conda package.",
-                package_file.to_string_lossy()
-            ));
-        }
-    }
-
-    let store = tool_configuration::get_auth_store(args.common.auth_file).into_diagnostic()?;
-
-    match args.server_type {
-        ServerType::Quetz(quetz_opts) => {
-            let quetz_data = QuetzData::from(quetz_opts);
-            upload::upload_package_to_quetz(&store, &args.package_files, quetz_data).await
-        }
-        ServerType::Artifactory(artifactory_opts) => {
-            let artifactory_data = ArtifactoryData::try_from(artifactory_opts)?;
-
-            upload::upload_package_to_artifactory(&store, &args.package_files, artifactory_data)
-                .await
-        }
-        ServerType::Prefix(prefix_opts) => {
-            let prefix_data = PrefixData::from(prefix_opts);
-            upload::upload_package_to_prefix(&store, &args.package_files, prefix_data).await
-        }
-        ServerType::Anaconda(anaconda_opts) => {
-            let anaconda_data = AnacondaData::from(anaconda_opts);
-            upload::upload_package_to_anaconda(&store, &args.package_files, anaconda_data).await
-        }
-        ServerType::S3(s3_opts) => {
-            upload::upload_package_to_s3(
-                &store,
-                s3_opts.channel,
-                s3_opts.endpoint_url,
-                s3_opts.region,
-                s3_opts.force_path_style,
-                s3_opts.access_key_id,
-                s3_opts.secret_access_key,
-                s3_opts.session_token,
-                &args.package_files,
-            )
-            .await
-        }
-        ServerType::CondaForge(conda_forge_opts) => {
-            let conda_forge_data = CondaForgeData::from(conda_forge_opts);
-            upload::conda_forge::upload_packages_to_conda_forge(
-                &args.package_files,
-                conda_forge_data,
-            )
-            .await
-        }
-    }
+    Ok(())
 }
 
 /// Sort the build outputs (recipes) topologically based on their dependencies.
-pub fn sort_build_outputs_topologically(
+///
+/// When `up_to` is specified, only outputs needed to build the named package are kept.
+fn sort_build_outputs_topologically(
     outputs: &mut Vec<Output>,
     up_to: Option<&str>,
 ) -> miette::Result<()> {
-    let mut graph = DiGraph::<usize, ()>::new();
-    let mut name_to_index = HashMap::new();
+    let sorted = topological_sort_by_dependencies(std::mem::take(outputs), |o| &o.recipe, up_to)
+        .into_diagnostic()?;
 
-    // Index outputs by their produced names for quick lookup
-    for (idx, output) in outputs.iter().enumerate() {
-        let idx = graph.add_node(idx);
-        name_to_index.insert(output.name().clone(), idx);
+    for output in &sorted {
+        tracing::debug!("Ordered output: {:?}", output.name().as_normalized());
     }
 
-    // Add edges based on dependencies
-    for output in outputs.iter() {
-        let output_idx = *name_to_index
-            .get(output.name())
-            .expect("We just inserted it");
-        for dep in output.recipe.requirements().run_build_host() {
-            let dep_name = match dep {
-                Dependency::Spec(spec) => spec
-                    .name
-                    .clone()
-                    .expect("MatchSpec should always have a name"),
-                Dependency::PinSubpackage(pin) => pin.pin_value().name.clone(),
-                Dependency::PinCompatible(pin) => pin.pin_value().name.clone(),
-            };
-
-            if let Some(&dep_idx) = name_to_index.get(&dep_name) {
-                // do not point to self (circular dependency) - this can happen with
-                // pin_subpackage in run_exports, for example.
-                if output_idx == dep_idx {
-                    continue;
-                }
-                graph.add_edge(output_idx, dep_idx, ());
-            }
-        }
-    }
-
-    let sorted_indices = if let Some(up_to) = up_to {
-        // Find the node index for the "up-to" package
-        let up_to_index = name_to_index.get(up_to).copied().ok_or_else(|| {
-            miette::miette!("The package '{}' was not found in the outputs", up_to)
-        })?;
-
-        // Perform a DFS post-order traversal from the "up-to" node to find all
-        // dependencies
-        let mut dfs = DfsPostOrder::new(&graph, up_to_index);
-        let mut sorted_indices = Vec::new();
-        while let Some(nx) = dfs.next(&graph) {
-            sorted_indices.push(nx);
-        }
-
-        sorted_indices
-    } else {
-        // Perform topological sort
-        let mut sorted_indices = toposort(&graph, None).map_err(|cycle| {
-            let node = cycle.node_id();
-            let name = outputs[node.index()].name();
-            miette::miette!("Cycle detected in dependencies: {}", name.as_source())
-        })?;
-        sorted_indices.reverse();
-        sorted_indices
-    };
-
-    sorted_indices
-        .iter()
-        .map(|idx| &outputs[idx.index()])
-        .for_each(|output| {
-            tracing::debug!("Ordered output: {:?}", output.name().as_normalized());
-        });
-
-    // Reorder outputs based on the sorted indices
-    *outputs = sorted_indices
-        .iter()
-        .map(|node| outputs[node.index()].clone())
-        .collect();
-
+    *outputs = sorted;
     Ok(())
 }
 
-/// Get the version of rattler-build.
+/// Get the version of Rattler-Build.
 pub fn get_rattler_build_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Build rattler-build recipes
+/// Build Rattler-Build recipes
 pub async fn build_recipes(
     recipe_paths: Vec<std::path::PathBuf>,
     build_data: BuildData,
@@ -924,17 +1241,24 @@ pub async fn build_recipes(
     let tool_config = get_tool_config(&build_data, log_handler)?;
     let mut outputs = Vec::new();
     for recipe_path in &recipe_paths {
+        tracing::info!(
+            "Processing recipe at path: {}",
+            recipe_path.canonicalize().unwrap().display()
+        );
         let output = get_build_output(&build_data, recipe_path, &tool_config).await?;
         outputs.extend(output);
     }
 
     if build_data.render_only {
+        // Sort outputs topologically even in render-only mode to show expected build order
+        sort_build_outputs_topologically(&mut outputs, build_data.up_to.as_deref())?;
+
         let outputs = if build_data.with_solve {
             let mut updated_outputs = Vec::new();
             for output in outputs {
                 updated_outputs.push(
                     output
-                        .resolve_dependencies(&tool_config)
+                        .resolve_dependencies(&tool_config, RunExportsDownload::DownloadMissing)
                         .await
                         .into_diagnostic()?,
                 );
@@ -955,7 +1279,251 @@ pub async fn build_recipes(
     outputs = skip_noarch(outputs, &tool_config).await?;
 
     sort_build_outputs_topologically(&mut outputs, build_data.up_to.as_deref())?;
-    run_build_from_args(outputs, tool_config).await?;
+    run_build_from_args(outputs, tool_config, build_data.markdown_summary.as_deref()).await?;
+
+    Ok(())
+}
+
+/// Build all outputs and collect the package paths
+async fn build_and_collect_packages(
+    build_output: Vec<Output>,
+    tool_configuration: &Configuration,
+) -> miette::Result<Vec<PathBuf>> {
+    let mut package_paths = Vec::new();
+    let outputs_to_build = skip_existing(build_output, tool_configuration).await?;
+
+    for output in outputs_to_build.iter() {
+        let (_output, archive) = match run_build(
+            output.clone(),
+            tool_configuration,
+            WorkingDirectoryBehavior::Cleanup,
+        )
+        .boxed_local()
+        .await
+        {
+            Ok((output, archive)) => {
+                output.record_build_end();
+                (output, archive)
+            }
+            Err(e) => {
+                if tool_configuration.continue_on_failure == ContinueOnFailure::Yes {
+                    tracing::error!("Build failed for {}: {}", output.identifier(), e);
+                    continue;
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        package_paths.push(archive);
+    }
+
+    Ok(package_paths)
+}
+
+/// Publish packages to a channel.
+///
+/// This function builds packages from recipes, uploads them to a specified channel,
+/// and runs indexing on the channel.
+pub async fn publish_packages(
+    publish_data: PublishData,
+    log_handler: &Option<console_utils::LoggingOutputHandler>,
+) -> Result<(), miette::Error> {
+    // Create tool configuration for cache clearing and building
+    let tool_config = get_tool_config(&publish_data.build, log_handler)?;
+
+    // Convert target to a channel URL
+    let target_url = publish_data.to.clone();
+    let channel_url = target_url
+        .clone()
+        .into_base_url(&tool_config.channel_config)
+        .into_diagnostic()?;
+
+    // Ensure the channel is initialized based on its type
+    match channel_url.url().scheme() {
+        "file" => {
+            let dir = channel_url
+                .url()
+                .to_file_path()
+                .map_err(|()| miette::miette!("Invalid file URL: {}", channel_url.url()))?;
+            if !dir.exists() {
+                tracing::info!(
+                    "Creating initial index for local channel at {}",
+                    dir.display()
+                );
+
+                fs::create_dir_all(&dir).into_diagnostic()?;
+
+                ensure_channel_initialized_fs(&dir).await.map_err(|e| {
+                    miette::miette!(
+                        "Failed to initialize local channel at {}: {}",
+                        dir.display(),
+                        e
+                    )
+                })?;
+            } else {
+                // check if it is a valid channel by looking for `noarch/repodata.json` file
+                let noarch_repodata = dir.join("noarch").join("repodata.json");
+                if !noarch_repodata.exists() {
+                    return Err(miette::miette!(
+                        "The specified local channel at {} is not initialized (missing {}). Please initialize the channel first.",
+                        dir.display(),
+                        noarch_repodata.display()
+                    ));
+                }
+            }
+        }
+        #[cfg(feature = "s3")]
+        "s3" => {
+            // Resolve S3 credentials and ensure the channel is initialized
+            let resolved_s3_credentials = tool_configuration::resolve_s3_credentials(
+                &publish_data.build.common.s3_config,
+                publish_data.build.common.auth_file.clone(),
+                channel_url.url(),
+            )
+            .await
+            .into_diagnostic()?;
+
+            ensure_channel_initialized_s3(channel_url.as_ref(), &resolved_s3_credentials)
+                .await
+                .map_err(|e| miette::miette!("Failed to initialize S3 channel: {}", e))?;
+        }
+        // Remote channels (http/https, quetz, prefix, etc.) handle initialization on the server side
+        _ => {}
+    }
+
+    // Check if we're publishing pre-built packages or building from recipes
+    let built_packages = if !publish_data.package_files.is_empty() {
+        // Publish pre-built packages directly
+        tracing::info!(
+            "Publishing {} pre-built package(s)",
+            publish_data.package_files.len()
+        );
+
+        // Validate that all package files exist
+        for package_file in &publish_data.package_files {
+            if !package_file.exists() {
+                return Err(miette::miette!(
+                    "Package file does not exist: {}",
+                    package_file.display()
+                ));
+            }
+        }
+
+        publish_data.package_files.clone()
+    } else {
+        // Build packages from recipes
+        let mut outputs = Vec::new();
+
+        // Expand recipe paths (handles directories by finding all recipes within them)
+        let mut expanded_recipe_paths = Vec::new();
+        for recipe_path in &publish_data.recipe_paths {
+            if recipe_path.is_dir() {
+                // For directories, scan for all recipes
+                for entry in ignore::Walk::new(recipe_path) {
+                    let entry = entry.into_diagnostic()?;
+                    if entry.path().is_dir()
+                        && let Ok(resolved_path) = get_recipe_path(entry.path())
+                    {
+                        expanded_recipe_paths.push(resolved_path);
+                    }
+                }
+            } else {
+                // For files, resolve directly (handles recipe.yaml in directory or direct yaml files)
+                let resolved_path = get_recipe_path(recipe_path)?;
+                expanded_recipe_paths.push(resolved_path);
+            }
+        }
+        // Sort to ensure deterministic ordering across platforms/filesystems
+        expanded_recipe_paths.sort();
+
+        for recipe_path in &expanded_recipe_paths {
+            let output = get_build_output(&publish_data.build, recipe_path, &tool_config).await?;
+            outputs.extend(output);
+        }
+
+        // Apply build number override if specified
+        if let Some(ref build_number_arg) = publish_data.build_number {
+            let build_number_override = BuildNumberOverride::parse(build_number_arg)?;
+
+            // For relative bumps, we need to fetch the highest build numbers from the target channel
+            let highest_build_numbers = match &build_number_override {
+                BuildNumberOverride::Relative(_) => {
+                    fetch_highest_build_numbers(
+                        &target_url,
+                        &outputs,
+                        publish_data.build.target_platform,
+                        &tool_config,
+                    )
+                    .await?
+                }
+                BuildNumberOverride::Absolute(num) => {
+                    tracing::info!("Setting build number to {} for all outputs", num);
+                    HashMap::new()
+                }
+            };
+
+            apply_build_number_override(
+                &mut outputs,
+                &build_number_override,
+                &highest_build_numbers,
+            );
+        }
+
+        if publish_data.build.render_only {
+            let outputs = if publish_data.build.with_solve {
+                let mut updated_outputs = Vec::new();
+                for output in outputs {
+                    updated_outputs.push(
+                        output
+                            .resolve_dependencies(&tool_config, RunExportsDownload::DownloadMissing)
+                            .await
+                            .into_diagnostic()?,
+                    );
+                }
+                updated_outputs
+            } else {
+                outputs
+            };
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&outputs).into_diagnostic()?
+            );
+            return Ok(());
+        }
+
+        // Skip noarch builds before the topological sort
+        outputs = skip_noarch(outputs, &tool_config).await?;
+
+        sort_build_outputs_topologically(&mut outputs, publish_data.build.up_to.as_deref())?;
+
+        // Build all packages and collect the paths
+        let built_packages = build_and_collect_packages(outputs, &tool_config).await?;
+
+        if built_packages.is_empty() {
+            tracing::info!("No packages were built");
+            return Ok(());
+        }
+
+        built_packages
+    };
+
+    let publish_config = PublishConfig {
+        force: publish_data.force,
+        generate_attestation: publish_data.generate_attestation,
+        auth_file: publish_data.build.common.auth_file.clone(),
+        #[cfg(feature = "s3")]
+        s3_config: publish_data.build.common.s3_config.clone(),
+    };
+
+    upload_and_index_channel(
+        &target_url,
+        &built_packages,
+        &publish_config,
+        &tool_config.repodata_gateway,
+    )
+    .await?;
 
     Ok(())
 }
@@ -974,28 +1542,33 @@ pub async fn debug_recipe(
         channels: debug_data.channels,
         common: debug_data.common,
         keep_build: true,
-        debug: Debug::new(true),
         test: TestStrategy::Skip,
         up_to: None,
-        variant_config: Vec::new(),
-        ignore_recipe_variants: false,
+        variant_config: debug_data.variant_config,
+        variant_overrides: debug_data.variant_overrides,
+        ignore_recipe_variants: debug_data.ignore_recipe_variants,
         render_only: false,
         with_solve: true,
         no_build_id: false,
         package_format: PackageFormatAndCompression {
-            archive_type: ArchiveType::Conda,
+            archive_type: CondaArchiveType::Conda,
             compression_level: CompressionLevel::Default,
         },
         compression_threads: None,
         io_concurrency_limit: num_cpus::get(),
         no_include_recipe: false,
         color_build_log: true,
-        tui: false,
         skip_existing: SkipExisting::None,
         noarch_build_platform: None,
         extra_meta: None,
         sandbox_configuration: None,
         continue_on_failure: ContinueOnFailure::No,
+        error_prefix_in_binary: false,
+        allow_symlinks_on_windows: false,
+        allow_absolute_license_paths: false,
+        exclude_newer: None,
+        build_num_override: None,
+        markdown_summary: None,
     };
 
     let tool_config = get_tool_config(&build_data, log_handler)?;
@@ -1029,22 +1602,7 @@ pub async fn debug_recipe(
     tracing::info!("Build and/or host environments created for debugging.");
 
     for output in outputs {
-        output
-            .build_configuration
-            .directories
-            .recreate_directories()
-            .into_diagnostic()?;
-        let output = output.fetch_sources(&tool_config).await.into_diagnostic()?;
-        let output = output
-            .resolve_dependencies(&tool_config)
-            .await
-            .into_diagnostic()?;
-        output
-            .install_environments(&tool_config)
-            .await
-            .into_diagnostic()?;
-
-        output.create_build_script().await.into_diagnostic()?;
+        let output = output.setup_debug_environment(&tool_config).await?;
 
         if let Some(deps) = &output.finalized_dependencies {
             if deps.build.is_some() {
@@ -1085,4 +1643,14 @@ pub async fn debug_recipe(
     }
 
     Ok(())
+}
+
+/// Display information about a built package
+pub fn show_package_info(args: InspectOpts) -> miette::Result<()> {
+    rattler_build_core::package_info::package_info(args.into())
+}
+
+/// Extract a conda package to a directory
+pub async fn extract_package(args: opt::ExtractOpts) -> miette::Result<()> {
+    rattler_build_core::package_info::extract_package(args.into()).await
 }

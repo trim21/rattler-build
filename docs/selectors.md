@@ -10,8 +10,8 @@ follows
 the same syntax as a Python expression.
 
 During rendering, several variables are set based on the platform and variant
-being built. For example, the `unix` variable is true for macOS and Linux, while
-`win` is true for Windows. Consider the following recipe executed on Linux:
+being built. For example, the `unix` variable is true when the host platform is macOS or Linux, while
+`win` is true when the host platform is Windows. Consider the following recipe executed on Linux:
 
 ```yaml
 requirements:
@@ -67,12 +67,14 @@ The following variables are available during rendering of the recipe:
 |----------------------|------------------------------------------------------------------------|
 | `target_platform`    | the configured `target_platform` for the build                         |
 | `build_platform`     | the configured `build_platform` for the build                          |
-| `linux`              | "true" if `target_platform` is Linux                                   |
-| `osx`                | "true" if `target_platform` is OSX / macOS                             |
-| `win`                | "true" if `target_platform` is Windows                                 |
-| `unix`               | "true" if `target_platform` is a Unix (macOS or Linux)                 |
-| `x86`, `x86_64`      | x86 32/64-bit Architecture                                             |
-| `aarch64`, `arm64`   | 64-bit Arm (these are the same but are both supported for legacy)      |
+| `host_platform`      | the configured `host_platform` for the build                           |
+| `linux`              | "true" if `host_platform` is Linux                                     |
+| `osx`                | "true" if `host_platform` is OSX / macOS                               |
+| `win`                | "true" if `host_platform` is Windows                                   |
+| `unix`               | "true" if `host_platform` is a Unix (macOS or Linux)                   |
+| `x86`, `x86_64`      | x86 32/64-bit Architecture (based on `host_platform`)                  |
+| `aarch64`            | 64-bit Arm (if `host_platform` is `linux-aarch64`)                     |
+| `arm64`              | 64-bit Arm (if `host_platform` is `osx-arm64` or `win-arm64`)          |
 | `armV6l`, `armV7l`   | 32-bit Arm                                                             |
 | `ppc64`, `s390x`,    | Big endian                                                             |
 | `ppc64le`            | Little endian                                                          |
@@ -142,16 +144,33 @@ variant, and thus the `match` condition always evaluates to `true`.
 
 ### Selector evaluation
 
-Except for the rattler-build specific selectors, the selectors are evaluated using the `minijinja` engine. This means
+Except for the Rattler-Build specific selectors, the selectors are evaluated using the `minijinja` engine. This means
 that the selectors are evaluated by [`minijinja`][minijinja] thus Python like expressions.
 Some notable options are:
 
 ```yaml
 - if: python == "3.8" # equal
 - if: python != "3.8" # not equal
-- if: python and linux # true if python variant is set and the target_platform is linux
-- if: python and not linux # true if python variant is set and the target_platform is not linux
-- if: python and (linux or osx) # true if python variant is set and the target_platform is linux or osx
+- if: python and linux # true if python variant is set and the host_platform is linux
+- if: python and not linux # true if python variant is set and the host_platform is not linux
+- if: python and (linux or osx) # true if python variant is set and the host_platform is linux or osx
 ```
 
 [minijinja]: https://github.com/mitsuhiko/minijinja
+
+### Alternatives for scalar fields
+
+Some fields accept scalars rather than lists, and selectors cannot be used. Alternatives include:
+
+```yaml
+string: ${{ "foobar" if USE_OPENMP else "bla" }}
+```
+
+```yaml
+string: |
+  {% if USE_OPENMP %}
+     blablabla
+  {% else %}
+     blabla
+  {% endif %}
+```

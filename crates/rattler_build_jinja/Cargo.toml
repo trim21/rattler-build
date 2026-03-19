@@ -1,0 +1,33 @@
+[package]
+name = "rattler_build_jinja"
+version = "0.1.3"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Jinja template engine integration for rattler-build, powered by minijinja"
+
+[features]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+serde_with = { workspace = true }
+thiserror = { workspace = true }
+itertools = { workspace = true }
+minijinja = { workspace = true }
+rattler_build_types = { workspace = true }
+rattler_conda_types = { workspace = true, default-features = false }
+strum = { workspace = true }
+lazy_static = { workspace = true }
+indexmap = { workspace = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs-err = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true, features = ["yaml"] }
+tempfile = { workspace = true }
+anyhow = { workspace = true }

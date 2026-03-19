@@ -1,32 +1,116 @@
 //! This is the main entry point for the `rattler-build` binary.
 
+// Use custom allocators for improved performance when the `performance` feature is enabled.
+// This must be at the crate root to set the global allocator.
+#[cfg(feature = "performance")]
+use rattler_build_allocator as _;
+
+mod debug;
+
 use std::{
     fs::File,
     io::{self, IsTerminal},
+    path::PathBuf,
 };
 
 use clap::{CommandFactory, Parser};
 use miette::IntoDiagnostic;
-use pixi_config::Config;
 use rattler_build::{
-    build_recipes,
+    build_recipes, bump_recipe,
     console_utils::init_logging,
-    debug_recipe, get_recipe_path,
-    opt::{App, BuildData, DebugData, RebuildData, ShellCompletion, SubCommands, TestData},
-    rebuild, run_test, upload_from_args,
+    debug_recipe, extract_package, get_recipe_path, migrate_recipe,
+    opt::{
+        App, BuildData, BumpRecipeOpts, DebugData, DebugSubCommands, MigrateRecipeOpts,
+        PackageCommands, PublishData, RebuildData, ShellCompletion, SubCommands, TestData,
+    },
+    publish_packages, rebuild, run_test, show_package_info,
+    tool_configuration::APP_USER_AGENT,
 };
+use rattler_config::config::ConfigBase;
+use rattler_upload::upload_from_args;
 use tempfile::{TempDir, tempdir};
-use tokio::fs::read_to_string;
+
+/// Run the bump-recipe command
+async fn run_bump_recipe(opts: BumpRecipeOpts) -> miette::Result<()> {
+    // Resolve recipe path
+    let recipe_path = get_recipe_path(&opts.recipe)?;
+
+    // Create a simple HTTP client
+    let client = reqwest::Client::builder()
+        .user_agent(APP_USER_AGENT)
+        .referer(false)
+        .build()
+        .into_diagnostic()?;
+
+    if opts.check_only {
+        // Only check for updates
+        match bump_recipe::check_for_updates(&recipe_path, &client, opts.include_prerelease).await {
+            Ok(Some(new_version)) => {
+                tracing::info!("New version available: {}", new_version);
+            }
+            Ok(None) => {
+                tracing::info!("No new version available");
+            }
+            Err(e) => {
+                return Err(miette::miette!("Failed to check for updates: {}", e));
+            }
+        }
+    } else {
+        // Bump the recipe
+        match bump_recipe::bump_recipe(
+            &recipe_path,
+            opts.version.as_deref(),
+            &client,
+            opts.include_prerelease,
+            opts.dry_run,
+            opts.keep_build_number,
+        )
+        .await
+        {
+            Ok(result) => {
+                tracing::debug!("Provider: {:?}", result.provider);
+                tracing::debug!(
+                    "SHA256 changes: {:?} -> {:?}",
+                    result.old_sha256,
+                    result.new_sha256
+                );
+            }
+            Err(bump_recipe::BumpRecipeError::NoNewVersion(v)) => {
+                tracing::info!("Recipe is already at the latest version ({})", v);
+            }
+            Err(e) => {
+                return Err(miette::miette!("Failed to bump recipe: {}", e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the migrate-recipe command
+fn run_migrate_recipe(opts: MigrateRecipeOpts) -> miette::Result<()> {
+    let recipe_path = get_recipe_path(&opts.recipe)?;
+
+    match migrate_recipe::migrate_recipe(&recipe_path, opts.dry_run) {
+        Ok(_) => {
+            if !opts.dry_run {
+                tracing::info!("Recipe migrated successfully: {}", recipe_path.display());
+            }
+        }
+        Err(migrate_recipe::MigrateRecipeError::NoCacheKey) => {
+            tracing::info!(
+                "Recipe does not use the deprecated 'cache:' format — no migration needed"
+            );
+        }
+        Err(e) => {
+            return Err(miette::miette!("Failed to migrate recipe: {}", e));
+        }
+    }
+
+    Ok(())
+}
 
 fn main() -> miette::Result<()> {
-    // Initialize sandbox in sync/single-threaded context before anything else
-    #[cfg(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-        target_os = "macos"
-    ))]
-    rattler_sandbox::init_sandbox();
-
     // Stack size varies significantly across platforms:
     // - Windows: only 1MB by default
     // - macOS/Linux: ~8MB by default
@@ -59,30 +143,17 @@ fn main() -> miette::Result<()> {
 
 async fn async_main() -> miette::Result<()> {
     let app = App::parse();
-    let log_handler = if !app.is_tui() {
-        Some(
-            init_logging(
-                &app.log_style,
-                &app.verbose,
-                &app.color,
-                app.wrap_log_lines,
-                #[cfg(feature = "tui")]
-                None,
-            )
-            .into_diagnostic()?,
-        )
-    } else {
-        #[cfg(not(feature = "tui"))]
-        return Err(miette::miette!("tui feature is not enabled!"));
-        #[cfg(feature = "tui")]
-        None
-    };
+    let log_handler = init_logging(
+        &app.log_style,
+        &app.verbose,
+        &app.color,
+        app.wrap_log_lines,
+        None::<fn() -> std::io::Stderr>,
+    )
+    .into_diagnostic()?;
 
     let config = if let Some(config_path) = app.config_file {
-        let config_str = read_to_string(&config_path).await.into_diagnostic()?;
-        let (config, _unused_keys) =
-            Config::from_toml(config_str.as_str(), Some(&config_path.clone()))?;
-        Some(config)
+        Some(ConfigBase::<()>::load_from_files(&[config_path]).into_diagnostic()?)
     } else {
         None
     };
@@ -111,42 +182,35 @@ async fn async_main() -> miette::Result<()> {
             let build_data = BuildData::from_opts_and_config(build_args, config);
 
             // Get all recipe paths and keep tempdir alive until end of the function
-            let (recipe_paths, _temp_dir) = recipe_paths(recipes, recipe_dir)?;
-
+            let (recipe_paths, _temp_dir) = recipe_paths(recipes, recipe_dir.as_ref())?;
             if recipe_paths.is_empty() {
-                miette::bail!("Couldn't detect any recipes.")
-            }
-
-            if build_data.tui {
-                #[cfg(feature = "tui")]
-                {
-                    let tui = rattler_build::tui::init().await?;
-                    let log_handler = init_logging(
-                        &app.log_style,
-                        &app.verbose,
-                        &app.color,
-                        Some(true),
-                        Some(tui.event_handler.sender.clone()),
-                    )
-                    .into_diagnostic()?;
-                    rattler_build::tui::run(tui, build_data, recipe_paths, log_handler).await?;
+                if recipe_dir.is_some() {
+                    tracing::warn!("No recipes found in recipe directory: {:?}", recipe_dir);
+                    return Ok(());
+                } else {
+                    miette::bail!("Couldn't find recipe.")
                 }
-                return Ok(());
             }
 
-            build_recipes(recipe_paths, build_data, &log_handler).await
+            build_recipes(recipe_paths, build_data, &Some(log_handler)).await
         }
+
+        Some(SubCommands::Publish(publish_args)) => {
+            let publish_data = PublishData::from_opts_and_config(publish_args, config);
+            publish_packages(publish_data, &Some(log_handler)).await
+        }
+
         Some(SubCommands::Test(test_args)) => {
             run_test(
                 TestData::from_opts_and_config(test_args, config),
-                log_handler,
+                Some(log_handler),
             )
             .await
         }
         Some(SubCommands::Rebuild(rebuild_args)) => {
             rebuild(
                 RebuildData::from_opts_and_config(rebuild_args, config),
-                log_handler.expect("logger is not initialized"),
+                log_handler,
             )
             .await
         }
@@ -156,11 +220,34 @@ async fn async_main() -> miette::Result<()> {
             rattler_build::recipe_generator::generate_recipe(args).await
         }
         Some(SubCommands::Auth(args)) => rattler::cli::auth::execute(args).await.into_diagnostic(),
-        Some(SubCommands::Debug(opts)) => {
-            let debug_data = DebugData::from_opts_and_config(opts, config);
-            debug_recipe(debug_data, &log_handler).await?;
-            Ok(())
-        }
+        Some(SubCommands::Debug(args)) => match args.subcommand {
+            DebugSubCommands::Setup(opts) => {
+                let debug_data = DebugData::from_setup_opts_and_config(opts, config);
+                debug_recipe(debug_data, &Some(log_handler)).await
+            }
+            DebugSubCommands::Shell(opts) => debug::debug_shell(opts).into_diagnostic(),
+            DebugSubCommands::HostAdd(opts) => {
+                debug::debug_env_add("host", opts, config, &Some(log_handler)).await
+            }
+            DebugSubCommands::BuildAdd(opts) => {
+                debug::debug_env_add("build", opts, config, &Some(log_handler)).await
+            }
+            DebugSubCommands::Workdir(opts) => debug::debug_workdir(opts).into_diagnostic(),
+            DebugSubCommands::Run(opts) => {
+                let exit_code = debug::debug_run(opts).into_diagnostic()?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
+            DebugSubCommands::CreatePatch(opts) => debug::debug_create_patch(opts),
+        },
+        Some(SubCommands::Package(cmd)) => match cmd {
+            PackageCommands::Inspect(opts) => show_package_info(opts),
+            PackageCommands::Extract(opts) => extract_package(opts).await,
+        },
+        Some(SubCommands::BumpRecipe(opts)) => run_bump_recipe(opts).await,
+        Some(SubCommands::MigrateRecipe(opts)) => run_migrate_recipe(opts),
         None => {
             _ = App::command().print_long_help();
             Ok(())
@@ -169,9 +256,9 @@ async fn async_main() -> miette::Result<()> {
 }
 
 fn recipe_paths(
-    recipes: Vec<std::path::PathBuf>,
-    recipe_dir: Option<std::path::PathBuf>,
-) -> Result<(Vec<std::path::PathBuf>, Option<TempDir>), miette::Error> {
+    recipes: Vec<PathBuf>,
+    recipe_dir: Option<&PathBuf>,
+) -> Result<(Vec<PathBuf>, Option<TempDir>), miette::Error> {
     let mut recipe_paths = Vec::new();
     let mut temp_dir_opt = None;
     if !std::io::stdin().is_terminal()
@@ -195,12 +282,14 @@ fn recipe_paths(
         if let Some(recipe_dir) = &recipe_dir {
             for entry in ignore::Walk::new(recipe_dir) {
                 let entry = entry.into_diagnostic()?;
-                if entry.path().is_dir() {
-                    if let Ok(recipe_path) = get_recipe_path(entry.path()) {
-                        recipe_paths.push(recipe_path);
-                    }
+                if entry.path().is_dir()
+                    && let Ok(recipe_path) = get_recipe_path(entry.path())
+                {
+                    recipe_paths.push(recipe_path);
                 }
             }
+            // Sort to ensure deterministic ordering across platforms/filesystems
+            recipe_paths.sort();
         }
     }
 

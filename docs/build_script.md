@@ -33,8 +33,8 @@ build:
         - cp $RECIPE_DIR/my_script_with_recipe.sh $PREFIX/bin/super-cool-script.sh
     - if: win
       then:
-        - mkdir %PREFIX%\bin
-        - copy %RECIPE_DIR%\my_script_with_recipe.bat %PREFIX%\bin\super-cool-script.bat
+        - mkdir %LIBRARY_BIN%
+        - copy %RECIPE_DIR%\my_script_with_recipe.bat %LIBRARY_BIN%\super-cool-script.bat
 ```
 
 ## Environment variables
@@ -68,7 +68,7 @@ build:
 
 ## Alternative script interpreters
 
-With `rattler-build` and the new recipe syntax you can select an `interpreter`
+With Rattler-Build and the new recipe syntax you can select an `interpreter`
 for your script.
 
 So far, the following interpreters are supported:
@@ -79,9 +79,11 @@ So far, the following interpreters are supported:
 - `python`
 - `perl`
 - `rscript` (for R scripts)
+- `ruby`
+- `node` or `nodejs` (for NodeJS scripts)
 
-`rattler-build` automatically detects the interpreter based on the file extension
-(`.sh`, `.bat`, `.nu`, `.py`, `.pl`, `.r`) or you can specify it in the
+Rattler-Build automatically detects the interpreter based on the file extension
+(`.sh`, `.bat`, `.nu`, `.py`, `.pl`, `.r`, `.rb`, `.js`) or you can specify it in the
 `interpreter` key in the `script` section of your recipe.
 
 ```yaml title="recipe.yaml"
@@ -134,6 +136,44 @@ build:
 requirements:
   build:
     - python
+```
+
+### Using `ruby`
+
+In order to use `ruby` you can select the `interpreter: ruby` or have a
+`build.rb` file in your recipe directory and `ruby` in the
+`requirements/build` section.
+
+```yaml title="recipe.yaml"
+build:
+  script:
+    interpreter: ruby
+    content: |
+      puts "Hello from Ruby!"
+
+# Note: it's required to have `ruby` in the `build` section of your recipe!
+requirements:
+  build:
+    - ruby
+```
+
+### Using `nodejs`
+
+In order to use `nodejs` you can select the `interpreter: nodejs` (or `node`) or have a
+`build.js` file in your recipe directory and `nodejs` in the
+`requirements/build` section.
+
+```yaml title="recipe.yaml"
+build:
+  script:
+    interpreter: nodejs
+    content: |
+      console.log("Hello from NodeJS!");
+
+# Note: it's required to have `nodejs` in the `build` section of your recipe!
+requirements:
+  build:
+    - nodejs
 ```
 
 
@@ -191,7 +231,7 @@ noted, no variables are inherited from the shell environment in which you invoke
 `PY_VER`
 
 : Specifies the Python version against which the build is occurring.
-  This can be modified with a `variant_config.yaml` file.
+  This can be modified with a `variants.yaml` file.
 
 `PATH`
 
@@ -278,7 +318,7 @@ defined only on Windows.
 | `LIBRARY_PREFIX` | `<build prefix>\Library`.         |
 | `SCRIPTS`        | `<build prefix>\Scripts`.         |
 
-Not yet supported in `rattler-build`:
+Not yet supported in Rattler-Build:
 
 - `CYGWIN_PREFIX`
 - `VS_MAJOR`

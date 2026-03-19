@@ -1,6 +1,6 @@
 # Jinja
 
-`rattler-build` comes with a couple of useful [Jinja](https://jinja.palletsprojects.com)
+Rattler-Build comes with a couple of useful [Jinja](https://jinja.palletsprojects.com)
 functions and filters that can be used in the recipe.
 
 ## Functions
@@ -42,7 +42,7 @@ Note that the final output will still contain the `target_platform`, so that the
 full compiler will read `clang_linux-64 9.0` when compiling with
 `--target-platform linux-64`.
 
-`rattler-build` defines some default compilers for the following languages
+Rattler-Build defines some default compilers for the following languages
 (inherited from `conda-build`):
 
 - `c`: `gcc` on Linux, `clang` on `osx` and `vs2017` on Windows
@@ -172,6 +172,66 @@ cdt('package-name') # outputs: package-name-cos6-x86_64
 cdt('package-name') # outputs: package-name-cos6-aarch64
 ```
 
+### The `match` function
+
+The `match` function allows you to perform version comparisons using conda's version matching syntax. This is particularly useful for conditionally including dependencies or skipping builds based on variants.
+
+**Syntax:** `match(version, version_spec)`
+
+**Parameters:**
+- `version`: A version string (typically from a variant variable like `python`)
+- `version_spec`: A conda version specification string supporting operators like `==`, `!=`, `<`, `<=`, `>`, `>=`, wildcards (`*`), and comma-separated combinations (e.g., `">=3.8"`, `"3.14.*"`, `">=3.7,<3.9"`)
+
+The function returns `true` if the version matches the specification, `false` otherwise.
+
+#### Usage examples
+
+Using `match` to conditionally skip builds:
+
+```yaml title="recipe.yaml"
+build:
+  skip: match(python, "<3.8")  # skip builds for Python < 3.8
+```
+
+Using `match` with conditional dependencies:
+
+```yaml title="recipe.yaml"
+requirements:
+  host:
+    - if: match(python, ">=3.9")
+      then: some-package
+```
+
+!!! note
+    When using `match` for conditional dependencies, these conditions are resolved during package build time, not when the package is installed. The resulting package will have fixed dependencies based on the variant configuration used during the build.
+
+Checking exact version matches:
+
+```yaml title="recipe.yaml"
+build:
+  skip: match(root_base, "<6.36")  # skip if root_base is older than 6.36
+```
+
+Using version ranges:
+
+```yaml title="recipe.yaml"
+requirements:
+  run:
+    - if: match(python, ">=3.8,<3.11")
+      then: backport-package
+```
+
+Using wildcard patterns:
+
+```yaml title="recipe.yaml"
+requirements:
+  run:
+    - if: match(python, "3.14.*")
+      then: python-3.14-specific-package
+```
+
+**Note:** The `match` function follows conda's standard version matching rules, making it more reliable than manual string parsing or comparison operations.
+
 ### The `hash` variable
 
 - `${{ hash }}` is the variant hash and is useful in the build string
@@ -199,36 +259,58 @@ You can also check for the existence of an environment variable:
 - `${{ env.exists("MY_ENV_VAR") }}` will return `true` if the environment
   variable `MY_ENV_VAR` is set and `false` otherwise.
 
+## Tests
+
+You can write tests using minijinja to check whether objects have certain properties.
+The syntax for a test is `${{ variable is test_name }}`.
+
+- `undefined`: Check whether a variable is undefined.
+- `defined`: Check whether a variable is defined.
+- `none`: Check whether a variable is none.
+- `safe`: Check whether a variable is safe.
+- `escaped`: Check whether a variable is escaped. Same as `is safe`.
+- `odd`: Check whether a number is odd.
+- `even`: Check whether a number is even.
+- `number`: Check whether a variable is a number.
+- `integer`: Check whether a variable is an integer.
+- `int`: Check whether a variable is an integer. Same as `is integer`.
+- `float`: Check whether a variable is a float.
+- `string`: Check whether a variable is a string.
+- `sequence`: Check whether a variable is a sequence.
+- `boolean`: Check whether a variable is a boolean.
+- `startingwith`: Check whether a variable is starting with another string: `${{ python is startingwith('3.12') }}`
+- `endingwith`: Check whether a variable is starting with another string: `${{ python is endingwith('.*') }}`
+
 ## Filters
 
 A feature of `jinja` is called "filters". Filters are functions that can be
 applied to variables in a template expression.
 
-The syntax for a filter is `{{ variable | filter_name }}`. A filter can also
+The syntax for a filter is `${{ variable | filter_name }}`. A filter can also
 take arguments, such as `... | replace('foo', 'bar')`.
 
 The following Jinja filters are available, taken from the upstream `minijinja`
 library:
 
-- `replace`: replace a string with another string (e.g. `"{{ 'foo' | replace('oo', 'aa') }}"` will return `"faa"`)
-- `lower`: convert a string to lowercase (e.g. `"{{ 'FOO' | lower }}"` will return `"foo"`)
-- `upper`: convert a string to uppercase (e.g. `"{{ 'foo' | upper }}"` will
-return `"FOO"`) - `int`: convert a string to an integer (e.g. `"{{ '42' | int }}"` will return `42`)
-- `abs`: return the absolute value of a number (e.g. `"{{ -42 | abs }}"` will return `42`)
-- `bool`: convert a value to a boolean (e.g. `"{{ 'foo' | bool }}"` will return `true`)
-- `default`: return a default value if the value is falsy (e.g. `"{{ '' | default('foo') }}"` will return `"foo"`)
-- `first`: return the first element of a list (e.g. `"{{ [1, 2, 3] | first }}"`
-will return `1`) - `last`: return the last element of a list (e.g. `"{{ [1, 2, 3] | last }}"` will return `3`)
-- `length`: return the length of a list (e.g. `"{{ [1, 2, 3] | length }}"` will return `3`)
-- `list`: convert a string to a list (e.g. `"{{ 'foo' | list }}"` will return `['f', 'o', 'o']`)
-- `join`: join a list with a separator (e.g. `"{{ [1, 2, 3] | join('.') }}"` will return `"1.2.3"`)
-- `min`: return the minimum value of a list (e.g. `"{{ [1, 2, 3] | min }}"` will return `1`)
-- `max`: return the maximum value of a list (e.g. `"{{ [1, 2, 3] | max }}"` will return `3`)
-- `reverse`: reverse a list (e.g. `"{{ [1, 2, 3] | reverse }}"` will return `[3, 2, 1]`)
-- `sort`: sort a list (e.g. `"{{ [3, 1, 2] | sort }}"` will return `[1, 2, 3]`)
-- `trim`: remove leading and trailing whitespace from a string (e.g. `"{{ ' foo ' | trim }}"` will return `"foo"`)
-- `unique`: remove duplicates from a list (e.g. `"{{ [1, 2, 1, 3] | unique }}"` will return `[1, 2, 3]`)
-- `split`: split a string into a list (e.g. `"{{ '1.2.3' | split('.') | list }}"` will return `['1', '2', '3']`). By default, splits on whitespace.
+- `replace`: replace a string with another string (e.g. `"${{ 'foo' | replace('oo', 'aa') }}"` will return `"faa"`)
+- `lower`: convert a string to lowercase (e.g. `"${{ 'FOO' | lower }}"` will return `"foo"`)
+- `upper`: convert a string to uppercase (e.g. `"${{ 'foo' | upper }}"` will return `"FOO"`)
+- `int`: convert a string to an integer (e.g. `"${{ '42' | int }}"` will return `42`)
+- `abs`: return the absolute value of a number (e.g. `"${{ -42 | abs }}"` will return `42`)
+- `bool`: convert a value to a boolean (e.g. `"${{ 'foo' | bool }}"` will return `true`)
+- `default`: return a default value if the value is falsy (e.g. `"${{ '' | default('foo') }}"` will return `"foo"`)
+- `first`: return the first element of a list (e.g. `"${{ [1, 2, 3] | first }}"` will return `1`)
+- `last`: return the last element of a list (e.g. `"${{ [1, 2, 3] | last }}"` will return `3`)
+- `length`: return the length of a list (e.g. `"${{ [1, 2, 3] | length }}"` will return `3`)
+- `list`: convert a string to a list (e.g. `"${{ 'foo' | list }}"` will return `['f', 'o', 'o']`)
+- `join`: join a list with a separator (e.g. `"${{ [1, 2, 3] | join('.') }}"` will return `"1.2.3"`)
+- `min`: return the minimum value of a list (e.g. `"${{ [1, 2, 3] | min }}"` will return `1`)
+- `max`: return the maximum value of a list (e.g. `"${{ [1, 2, 3] | max }}"` will return `3`)
+- `reverse`: reverse a list (e.g. `"${{ [1, 2, 3] | reverse }}"` will return `[3, 2, 1]`)
+- `sort`: sort a list (e.g. `"${{ [3, 1, 2] | sort }}"` will return `[1, 2, 3]`)
+- `trim`: remove leading and trailing whitespace from a string (e.g. `"${{ ' foo ' | trim }}"` will return `"foo"`)
+- `unique`: remove duplicates from a list (e.g. `"${{ [1, 2, 1, 3] | unique }}"` will return `[1, 2, 3]`)
+- `split`: split a string into a list (e.g. `"${{ '1.2.3' | split('.') | list }}"` will return `['1', '2', '3']`). By default, splits on whitespace.
 
 ??? "Removed filters"
 
@@ -300,6 +382,33 @@ build:
   number: ${{ 100 if cuda == "yes" }}
   # or an `else` branch can be used, of course
   number: ${{ 100 if cuda == "yes" else 0 }}
+```
+
+#### Comments
+
+Jinja comments use the standard `{# ... #}` syntax. Anything between `{#` and
+`#}` is stripped from the output and can span multiple lines.
+
+```yaml
+context:
+  name: mypackage
+  version: "1.0"
+
+package:
+  name: ${{ name }}  {# this comment will not appear in the output #}
+  version: ${{ version }}
+```
+
+Multiline comments are also supported:
+
+```yaml
+package:
+  name: mypackage
+  {#
+    This is a multiline comment.
+    It will be completely removed from the output.
+  #}
+  version: "1.0"
 ```
 
 #### Slicing lists

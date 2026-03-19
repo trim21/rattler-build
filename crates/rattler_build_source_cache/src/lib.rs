@@ -1,0 +1,25 @@
+//! # Rattler Build Source Cache
+//!
+//! This crate provides a unified source cache for Rattler-Build, handling Git repositories,
+//! URL downloads, and local paths with proper caching, extraction, and concurrent access control.
+
+pub mod builder;
+pub mod cache;
+pub mod error;
+pub mod index;
+pub mod lock;
+#[cfg(feature = "sigstore")]
+mod sigstore;
+pub mod source;
+
+pub use builder::SourceCacheBuilder;
+pub use cache::{SourceCache, SourceResult};
+pub use error::CacheError;
+pub use index::{CacheEntry, CacheIndex, SourceType};
+pub use rattler_build_networking::{BaseClient, BaseClientBuilder};
+pub use rattler_git::GitUrl;
+pub use rattler_git::git::GitReference;
+pub use source::{AttestationVerification, Checksum, GitSource, IdentityCheck, Source, UrlSource};
+
+#[cfg(test)]
+mod tests;

@@ -4,11 +4,27 @@ target/
 .idea/
 __pycache__/
 .pytest_cache/
+.DS_STORE
+checkouts
+.mypy_cache
 
 # mkdocs
 .cache
 site
 
+# playground
+deploy/
+
 # pixi environments
 .pixi
 target-pixi
+*.conda
+
+# python
+.ipynb_checkpoints
+
+# generated tutorial markdown (from notebooks)
+docs/py-rattler-build/tutorials/
+
+# pytest temp directories
+pytest-temp
