@@ -188,27 +188,35 @@ jobs:
         shell: bash
         run: |
           PKG_BASENAME=rattler-build-${{ matrix.target }}
-          PKG_NAME=${PKG_BASENAME}${{ contains(matrix.target, 'pc-windows') && '.zip' || '.tar.gz' }}
 
+          # Determine archive and binary extensions based on target
+          case "${{ matrix.target }}" in
+            *-pc-windows-*) ARCHIVE_EXT=".zip"; BIN_EXT=".exe" ;;
+            *-apple-darwin*) ARCHIVE_EXT=".zip"; BIN_EXT="" ;;
+            *) ARCHIVE_EXT=".tar.gz"; BIN_EXT="" ;;
+          esac
+
+          PKG_NAME="${PKG_BASENAME}${ARCHIVE_EXT}"
           ARCHIVE_DIR="pkg/${PKG_BASENAME}"
           mkdir -p "${ARCHIVE_DIR}"
 
-          cp "target/${{ matrix.target }}/release/rattler-build${{ contains(matrix.target, 'pc-windows') && '.exe' || '' }}" "$ARCHIVE_DIR"
+          cp "target/${{ matrix.target }}/release/rattler-build${BIN_EXT}" "$ARCHIVE_DIR"
           cp README.md LICENSE "$ARCHIVE_DIR"
 
           pushd pkg >/dev/null
-          case ${{ matrix.target }} in
+          case "${{ matrix.target }}" in
             *-pc-windows-*) 7z -y a "${PKG_NAME}" "${PKG_BASENAME}"/* | tail -2 ;;
+            *-apple-darwin*) zip -r "${PKG_NAME}" "${PKG_BASENAME}"/* ;;
             *) tar czf "${PKG_NAME}" "${PKG_BASENAME}"/* ;;
-          esac;
+          esac
           popd >/dev/null
 
           echo "pkg-name=${PKG_NAME}" >> $GITHUB_OUTPUT
-          echo pkg-path="${ARCHIVE_DIR}${{ contains(matrix.target, 'pc-windows') && '.zip' || '.tar.gz' }}" >> $GITHUB_OUTPUT
+          echo "pkg-path=pkg/${PKG_NAME}" >> $GITHUB_OUTPUT
 
           mkdir -p binaries
-          cp "target/${{ matrix.target }}/release/rattler-build${{ contains(matrix.target, 'pc-windows') && '.exe' || '' }}" "binaries/rattler-build-${{ matrix.target }}${{ contains(matrix.target, 'pc-windows') && '.exe' || '' }}"
-          echo "binary-path=binaries/rattler-build-${{ matrix.target }}${{ contains(matrix.target, 'pc-windows') && '.exe' || '' }}" >> $GITHUB_OUTPUT
+          cp "target/${{ matrix.target }}/release/rattler-build${BIN_EXT}" "binaries/rattler-build-${{ matrix.target }}${BIN_EXT}"
+          echo "binary-path=binaries/rattler-build-${{ matrix.target }}${BIN_EXT}" >> $GITHUB_OUTPUT
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
